@@ -1,0 +1,13 @@
+# Qt build
+client-software/build
+client-software/gaspyc.pro.user
+
+# Platform IO
+esp32-firmware/.pio
+esp32-firmware/.vscode/.browse.c_cpp.db*
+esp32-firmware/.vscode/c_cpp_properties.json
+esp32-firmware/.vscode/launch.json
+esp32-firmware/.vscode/ipch
+
+# Secrets
+esp32-firmware/include/secrets.h
