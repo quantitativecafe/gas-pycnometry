@@ -15,16 +15,6 @@ OptionsDialog::~OptionsDialog()
     delete ui;
 }
 
-void OptionsDialog::setHostName(const QString &name)
-{
-    ui->hostName->setText(name);
-}
-
-QString OptionsDialog::hostName(void) const
-{
-    return ui->hostName->text();
-}
-
 void OptionsDialog::setTriggerMode(MainWindow::TriggerMode mode)
 {
     ui->triggerMode->setCurrentIndex((int) mode);

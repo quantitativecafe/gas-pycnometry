@@ -3,7 +3,10 @@
 
 #include <QMainWindow>
 #include <QVector>
-#include <QTcpSocket>
+#include <QtBluetooth/QBluetoothDeviceDiscoveryAgent>
+#include <QtBluetooth/QLowEnergyController>
+#include <QtBluetooth/QLowEnergyService>
+#include <QtBluetooth/QLowEnergyCharacteristic>
 
 class QCustomPlot;
 
@@ -39,16 +42,19 @@ public:
     };
 
 public slots:
+    void onDeviceDiscovered(const QBluetoothDeviceInfo &device);
+    void onDeviceDiscoveryError(QBluetoothDeviceDiscoveryAgent::Error error);
     void onConnected();
     void onDisconnected();
-    void onReadyRead();
-    void onErrorOccurred(QAbstractSocket::SocketError socketError);
+    void onServiceDiscovered(const QBluetoothUuid &serviceUuid);
+    void onServiceDiscoveryFinished();
+    void onServiceStateChanged(QLowEnergyService::ServiceState newState);
+    void onCharacteristicChanged(const QLowEnergyCharacteristic &characteristic, const QByteArray &newValue);
+    void onErrorOccurred(QLowEnergyController::Error error);
 
 private slots:
     void on_options_clicked();
-
     void on_saveCancel_clicked();
-
     void on_trialNumber_valueChanged(int value);
 
 private:
@@ -56,9 +62,10 @@ private:
 
     float maxPressure;
 
-    QTcpSocket *socket;
-    QString hostName;
-    QString buf;
+    QBluetoothDeviceDiscoveryAgent *discoveryAgent;
+    QLowEnergyController *bleController;
+    QLowEnergyService *bleService;
+    QLowEnergyCharacteristic dataCharacteristic;
 
     TriggerMode triggerMode;
     float triggerPressure;
@@ -79,7 +86,7 @@ private:
     void updateInterface();
     void saveData();
     void writeData();
-
     void setTrialNumber(int val);
+    void processData(const QString &data);
 };
 #endif // MAINWINDOW_H

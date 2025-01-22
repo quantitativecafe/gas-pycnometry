@@ -17,9 +17,6 @@ public:
     explicit OptionsDialog(QWidget *parent = nullptr);
     ~OptionsDialog();
 
-    void setHostName(const QString &name);
-    QString hostName(void) const;
-
     void setTriggerMode(MainWindow::TriggerMode mode);
     MainWindow::TriggerMode triggerMode() const;
 

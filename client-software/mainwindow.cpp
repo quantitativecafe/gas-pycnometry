@@ -3,15 +3,24 @@
 
 #include <QMessageBox>
 #include <QSettings>
+#include <QBluetoothDeviceDiscoveryAgent>
+#include <QLowEnergyController>
+#include <QLowEnergyService>
+#include <QLowEnergyCharacteristic>
 
 #include "optionsdialog.h"
+
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
 MainWindow::MainWindow(QWidget *parent):
     QMainWindow(parent),
     ui(new Ui::MainWindow),
-    maxPressure(103.42),
-    socket(new QTcpSocket(this)),
-    hostName("192.168.0.104"),
+    maxPressure(103.42f),
+    discoveryAgent(new QBluetoothDeviceDiscoveryAgent(this)),
+    bleController(nullptr),
+    bleService(nullptr),
+    dataCharacteristic(),
     triggerMode(triggerFalling),
     triggerPressure(80),
     triggered(false),
@@ -22,7 +31,6 @@ MainWindow::MainWindow(QWidget *parent):
 
     // Get persistent settings
     QSettings settings("QuantitativeCafe", "GasPyc-2");
-    hostName = settings.value("hostName", hostName).toString();
     triggerMode = (TriggerMode) settings.value("triggerMode", triggerMode).toInt();
     triggerPressure = settings.value("triggerPressure", triggerPressure).toFloat();
     logFolder = settings.value("logFolder", logFolder).toString();
@@ -36,14 +44,12 @@ MainWindow::MainWindow(QWidget *parent):
     ui->savedPlot->setBackground(QBrush(QColor(0, 0, 0, 0)));
     ui->savedPlot->axisRect()->setBackground(QBrush(QColor(255, 255, 255, 255)));
 
-    // Configure TCP socket
-    connect(socket, &QTcpSocket::connected, this, &MainWindow::onConnected);
-    connect(socket, &QTcpSocket::readyRead, this, &MainWindow::onReadyRead);
-    connect(socket, &QTcpSocket::disconnected, this, &MainWindow::onDisconnected);
-    connect(socket, QOverload<QAbstractSocket::SocketError>::of(&QTcpSocket::errorOccurred), this, &MainWindow::onErrorOccurred);
+    // Configure BLE
+    connect(discoveryAgent, &QBluetoothDeviceDiscoveryAgent::deviceDiscovered, this, &MainWindow::onDeviceDiscovered);
+    connect(discoveryAgent, &QBluetoothDeviceDiscoveryAgent::errorOccurred, this, &MainWindow::onDeviceDiscoveryError);
 
-    ui->status->append("Connecting to " + hostName);
-    socket->connectToHost(hostName, 80);
+    ui->status->append("Scanning for BLE devices...");
+    discoveryAgent->start();
 
     // Update filename
     setTrialNumber(trialNumber);
@@ -51,10 +57,11 @@ MainWindow::MainWindow(QWidget *parent):
 
 MainWindow::~MainWindow()
 {
-    if (socket->isOpen()) {
-        socket->close();
+    if (bleController) {
+        bleController->disconnectFromDevice();
+        delete bleController;
     }
-    delete socket;
+    delete discoveryAgent;
     delete ui;
 }
 
@@ -110,138 +117,179 @@ static void getFit(double *deltaPressure, double *deviation, const QVector<doubl
     *deviation = sqrt(sumsq / times.length());
 }
 
+void MainWindow::onDeviceDiscovered(const QBluetoothDeviceInfo &device)
+{
+    if (device.name().contains("ESP32_Pycnometer")) { // Replace with your BLE device name
+        ui->status->append("Found BLE device: " + device.name());
+        discoveryAgent->stop();
+
+        bleController = QLowEnergyController::createCentral(device, this);
+        connect(bleController, &QLowEnergyController::connected, this, &MainWindow::onConnected);
+        connect(bleController, &QLowEnergyController::errorOccurred, this, &MainWindow::onErrorOccurred);
+        connect(bleController, &QLowEnergyController::disconnected, this, &MainWindow::onDisconnected);
+        connect(bleController, &QLowEnergyController::serviceDiscovered, this, &MainWindow::onServiceDiscovered);
+        connect(bleController, &QLowEnergyController::discoveryFinished, this, &MainWindow::onServiceDiscoveryFinished);
+
+        ui->status->append("Connecting to BLE device...");
+        bleController->connectToDevice();
+    }
+}
+
+void MainWindow::onDeviceDiscoveryError(QBluetoothDeviceDiscoveryAgent::Error error)
+{
+    Q_UNUSED(error);
+    ui->status->append("BLE device discovery error: " + discoveryAgent->errorString());
+}
+
 void MainWindow::onConnected()
 {
-    ui->status->append("Connected to host");
+    ui->status->append("Connected to BLE device");
+    bleController->discoverServices();
 }
 
 void MainWindow::onDisconnected()
 {
-    ui->status->append("Disconnected from host");
+    ui->status->append("Disconnected from BLE device");
+    bleService = nullptr;
+    dataCharacteristic = QLowEnergyCharacteristic();
 }
 
-void MainWindow::onErrorOccurred(QAbstractSocket::SocketError socketError) {
-    QString errorString;
-    switch (socketError) {
-    case QAbstractSocket::RemoteHostClosedError:
-        errorString = "Remote host closed the connection";
-        break;
-    case QAbstractSocket::HostNotFoundError:
-        errorString = "Host not found";
-        break;
-    case QAbstractSocket::ConnectionRefusedError:
-        errorString = "Connection refused by the host";
-        break;
-    default:
-        errorString = socket->errorString();
-        break;
-    }
-    ui->status->append("Error: " + errorString);
-}
-
-void MainWindow::onReadyRead()
+void MainWindow::onServiceDiscovered(const QBluetoothUuid &serviceUuid)
 {
-    buf += QString(socket->readAll());
-    QStringList lines = buf.split("\n");
+    if (serviceUuid == QBluetoothUuid(QString(SERVICE_UUID))) {
+        ui->status->append("Found service: " + serviceUuid.toString());
+        bleService = bleController->createServiceObject(serviceUuid, this);
+        if (bleService) {
+            connect(bleService, &QLowEnergyService::stateChanged, this, &MainWindow::onServiceStateChanged);
+            connect(bleService, &QLowEnergyService::characteristicChanged, this, &MainWindow::onCharacteristicChanged);
+            bleService->discoverDetails();
+        }
+    }
+}
 
-    while (lines.count() > 1) {
-        // For each row
-        QString row = lines.takeFirst().trimmed();
-        QStringList cols = row.split(",");
+void MainWindow::onServiceDiscoveryFinished()
+{
+    ui->status->append("Service discovery finished");
+}
 
-        // Skip if the wrong number of columns
-        if (cols.count() != 5) continue;
+void MainWindow::onServiceStateChanged(QLowEnergyService::ServiceState newState)
+{
+    if (newState == QLowEnergyService::RemoteServiceDiscovered) {
+        dataCharacteristic = bleService->characteristic(QBluetoothUuid(QString(CHARACTERISTIC_UUID)));
+        if (dataCharacteristic.isValid()) {
+            ui->status->append("Found data characteristic");
+            bleService->writeDescriptor(dataCharacteristic.descriptor(QBluetoothUuid(QString("00002902-0000-1000-8000-00805f9b34fb"))),
+                                        QByteArray::fromHex("0100")); // Enable notifications
+        }
+    }
+}
 
-        // Get values
-        double x = cols[0].toDouble();
-        double y1 = cols[1].toDouble();
-        double z1 = cols[2].toDouble();
-        double y2 = cols[3].toDouble();
-        double z2 = cols[4].toDouble();
+void MainWindow::onCharacteristicChanged(const QLowEnergyCharacteristic &characteristic, const QByteArray &newValue)
+{
+    if (characteristic.uuid() == QBluetoothUuid(QString(CHARACTERISTIC_UUID))) {
+        QString data = QString::fromUtf8(newValue);
+        processData(data);
+    }
+}
 
-        // Add to samples
-        liveData.time.push_back(x);
-        liveData.pres_1.push_back(y1);
-        liveData.temp_1.push_back(z1);
-        liveData.pres_2.push_back(y2);
-        liveData.temp_2.push_back(z1);
+void MainWindow::processData(const QString &data)
+{
+    QStringList cols = data.split(",");
 
-        // Set current data
-        ui->currentTime_1->setText(QString::number(x, 'f', 1));
-        ui->currentTime_2->setText(QString::number(x, 'f', 1));
-        ui->currentPressure_1->setText(QString::number(y1, 'f', 3));
-        ui->currentPressure_2->setText(QString::number(y2, 'f', 3));
-        ui->currentTemperature_1->setText(QString::number(z1, 'f', 2));
-        ui->currentTemperature_2->setText(QString::number(z2, 'f', 2));
+    // Skip if the wrong number of columns
+    if (cols.count() != 5) return;
 
-        if (liveData.time.empty()) {
+    // Get values
+    double x = cols[0].toDouble();
+    double y1 = cols[1].toDouble();
+    double z1 = cols[2].toDouble();
+    double y2 = cols[3].toDouble();
+    double z2 = cols[4].toDouble();
+
+    // Add to samples
+    liveData.time.push_back(x);
+    liveData.pres_1.push_back(y1);
+    liveData.temp_1.push_back(z1);
+    liveData.pres_2.push_back(y2);
+    liveData.temp_2.push_back(z2);
+
+    // Set current data
+    ui->currentTime_1->setText(QString::number(x, 'f', 1));
+    ui->currentTime_2->setText(QString::number(x, 'f', 1));
+    ui->currentPressure_1->setText(QString::number(y1, 'f', 3));
+    ui->currentPressure_2->setText(QString::number(y2, 'f', 3));
+    ui->currentTemperature_1->setText(QString::number(z1, 'f', 2));
+    ui->currentTemperature_2->setText(QString::number(z2, 'f', 2));
+
+    if (liveData.time.empty()) {
+        ui->deltaPressure_1->clear();
+        ui->deviation_1->clear();
+        ui->deltaPressure_2->clear();
+        ui->deviation_2->clear();
+    } else {
+        int i;
+
+        const int n = liveData.time.length();
+        const double tLast = liveData.time[n - 1];
+
+        for (i = n - 1; i >= 0; --i) {
+            if (liveData.time[i] < tLast - 30) break;
+        }
+
+        if (i < 0) {
             ui->deltaPressure_1->clear();
             ui->deviation_1->clear();
             ui->deltaPressure_2->clear();
             ui->deviation_2->clear();
         } else {
-            int i;
+            double deltaPressure_1, deviation_1;
+            double deltaPressure_2, deviation_2;
 
-            const int n = liveData.time.length();
-            const double tLast = liveData.time[n - 1];
+            // Calculate deviation
+            getFit(&deltaPressure_1, &deviation_1, liveData.time.mid(i), liveData.pres_1.mid(i));
+            getFit(&deltaPressure_2, &deviation_2, liveData.time.mid(i), liveData.pres_2.mid(i));
 
-            for (i = n - 1; i >= 0; --i) {
-                if (liveData.time[i] < tLast - 30) break;
-            }
+            // Update interface
+            ui->deltaPressure_1->setText(QString::number(deltaPressure_1, 'f', 6));
+            ui->deviation_1->setText(QString::number(deviation_1, 'f', 6));
+            ui->deltaPressure_2->setText(QString::number(deltaPressure_2, 'f', 6));
+            ui->deviation_2->setText(QString::number(deviation_2, 'f', 6));
 
-            if (i < 0) {
-                ui->deltaPressure_1->clear();
-                ui->deviation_1->clear();
-                ui->deltaPressure_2->clear();
-                ui->deviation_2->clear();
-            } else {
-                double deltaPressure_1, deviation_1;
-                double deltaPressure_2, deviation_2;
-
-                // Calculate deviation
-                getFit(&deltaPressure_1, &deviation_1, liveData.time.mid(i), liveData.pres_1.mid(i));
-                getFit(&deltaPressure_2, &deviation_2, liveData.time.mid(i), liveData.pres_2.mid(i));
-
-                // Update interface
-                ui->deltaPressure_1->setText(QString::number(deltaPressure_1, 'f', 6));
-                ui->deviation_1->setText(QString::number(deviation_1, 'f', 6));
-                ui->deltaPressure_2->setText(QString::number(deltaPressure_2, 'f', 6));
-                ui->deviation_2->setText(QString::number(deviation_2, 'f', 6));
-
-                // Add to samples
-                deviation.time.push_back(x);
-                deviation.deviation_1.push_back(deviation_1);
-                deviation.deviation_2.push_back(deviation_2);
-            }
+            // Add to samples
+            deviation.time.push_back(x);
+            deviation.deviation_1.push_back(deviation_1);
+            deviation.deviation_2.push_back(deviation_2);
         }
-
-        int n = liveData.time.length();
-        if (n >= 2) {
-            // Get current and previous midpoint
-            double t0 = liveData.time[n - 1] - 30;
-            double t0_prev = liveData.time[n - 2] - 30;
-
-            // Check if the trigger crossed the midpoint
-            if (triggered && (triggerTime > t0_prev) && (triggerTime < t0)) {
-                // Save to disk
-                saveData();
-
-                // Clear trigger
-                triggered = false;
-
-                // Update interface
-                updateInterface();
-            }
-        }
-
-        // Update trigger
-        updateTrigger();
-
-        // Update plots
-        updatePlots();
     }
 
-    buf = lines.takeFirst();
+    int n = liveData.time.length();
+    if (n >= 2) {
+        // Get current and previous midpoint
+        double t0 = liveData.time[n - 1] - 30;
+        double t0_prev = liveData.time[n - 2] - 30;
+
+        // Check if the trigger crossed the midpoint
+        if (triggered && (triggerTime > t0_prev) && (triggerTime < t0)) {
+            // Save to disk
+            saveData();
+
+            // Clear trigger
+            triggered = false;
+
+            // Update interface
+            updateInterface();
+        }
+    }
+
+    // Update plots and trigger logic
+    updatePlots();
+    updateTrigger();
+}
+
+void MainWindow::onErrorOccurred(QLowEnergyController::Error error)
+{
+    Q_UNUSED(error);
+    ui->status->append("BLE error: " + bleController->errorString());
 }
 
 void MainWindow::configurePlot(QCustomPlot *plot)
@@ -409,34 +457,21 @@ void MainWindow::on_options_clicked()
     OptionsDialog dialog(this);
 
     // Copy current settings to dialog
-    dialog.setHostName(hostName);
     dialog.setTriggerMode(triggerMode);
     dialog.setTriggerPressure(triggerPressure);
     dialog.setLogFolder(logFolder);
 
     if (dialog.exec()) {
         // Update current settings
-        hostName = dialog.hostName();
         triggerMode = dialog.triggerMode();
         triggerPressure = dialog.triggerPressure();
         logFolder = dialog.logFolder();
 
         // Update persistent settings
         QSettings settings("QuantitativeCafe", "GasPyc-2");
-        settings.setValue("hostName", hostName);
         settings.setValue("triggerMode", triggerMode);
         settings.setValue("triggerPressure", triggerPressure);
         settings.setValue("logFolder", logFolder);
-
-        // Update socket
-        if (socket->state() == QTcpSocket::ConnectedState || socket->state() == QTcpSocket::ConnectingState) {
-            socket->disconnectFromHost();
-            if (socket->state() == QTcpSocket::ConnectedState) {
-                socket->waitForDisconnected();
-            }
-        }
-        ui->status->append("Connecting to " + hostName);
-        socket->connectToHost(hostName, 80);
 
         // Update filename
         setTrialNumber(trialNumber);

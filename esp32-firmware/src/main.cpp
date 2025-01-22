@@ -1,15 +1,11 @@
-/*********
-  Rui Santos
-  Complete project details at https://randomnerdtutorials.com  
-*********/
-
 #include <Arduino.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <WiFi.h>
-#include <WiFiClient.h>
-#include <WiFiAP.h>
 #include <Wire.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 #include "secrets.h"
 
@@ -53,11 +49,6 @@ enum {
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 
-// Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
-// The pins for I2C are defined by the Wire-library. 
-// On an arduino UNO:       A4(SDA), A5(SCL)
-// On an arduino MEGA 2560: 20(SDA), 21(SCL)
-// On an arduino LEONARDO:   2(SDA),  3(SCL), ...
 #define OLED_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
 #define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Baro1, OLED_RESET);
@@ -69,16 +60,13 @@ float p2, t2;
 
 unsigned long startTime;
 
-// Set your Static IP address
-IPAddress local_IP(192, 168, 0, 104);
-IPAddress gateway(192, 168, 0, 1);
-IPAddress subnet(255, 255, 255, 0);
+// BLE Server, Service, and Characteristic
+BLEServer* pServer = NULL;
+BLEService* pService = NULL;
+BLECharacteristic* pCharacteristic = NULL;
 
-WiFiServer server(80);
-WiFiClient client;
-bool connected = false;
-
-const char* hostname = "pycnometer";
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
 void IRAM_ATTR onTimer() {
   cur_us += step_us;
@@ -114,26 +102,27 @@ void setup() {
   display.setTextColor(WHITE);
   display.setRotation(0); //rotates text on OLED 1=90 degrees, 2=180 degrees
 
-  // Configuring static IP
-  if (!WiFi.config(local_IP, gateway, subnet)) {
-    Serial.println("STA Failed to configure");
-  }
+  // Initialize BLE
+  BLEDevice::init("ESP32_Pycnometer");
+  pServer = BLEDevice::createServer();
+  pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ   |
+                      BLECharacteristic::PROPERTY_NOTIFY |
+                      BLECharacteristic::PROPERTY_INDICATE
+                    );
 
-  // Set the hostname before connecting
-  WiFi.setHostname(hostname);
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
 
-  // Set up Wi-Fi
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connecting to WiFi...");
-  }
-  Serial.println("Connected to WiFi");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  // Start the server
-  server.begin();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);  // functions that help with iPhone connections issue
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  Serial.println("BLE service started");
 }
 
 void ReadBaro(TwoWire *baro, float *p, float *t) {
@@ -271,21 +260,6 @@ void ButtonPress() {
 }
 
 void loop() {
-  // Check if there is a new client connecting
-  if (!connected) {
-    client = server.available();
-    if (client) {
-      Serial.println("New client connected");
-      connected = true;
-    }
-  }
-
-  if (connected && !client.connected()) {
-    client.stop();
-    Serial.println("Client disconnected");
-    connected = false;
-  }
-
   if (read_value) {
     ReadBaro(&Baro1, &p1, &t1);
     ReadBaro(&Baro2, &p2, &t2);
@@ -296,10 +270,9 @@ void loop() {
                   String(p2, 3) + "," +
                   String(t2, 2);
 
-    // Print to Wi-Fi client
-    if (connected) {
-        client.println(data);
-    }
+    // Update BLE characteristic value
+    pCharacteristic->setValue(data.c_str());
+    pCharacteristic->notify();
 
     read_value = false;
   }
